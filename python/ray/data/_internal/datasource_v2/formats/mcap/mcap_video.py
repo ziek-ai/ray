@@ -460,6 +460,27 @@ def detect_codec(payload: bytes) -> Optional[VideoCodec]:
     return None
 
 
+def carries_picture(payload: bytes, codec: VideoCodec) -> bool:
+    """Whether the payload holds coded picture data, not only parameter sets.
+
+    A recorder may write SPS/PPS (or VPS) in a message of their own ahead of a
+    keyframe; a decoder fed such a message has nothing to output, which is not
+    an error worth reporting. A VP9 frame is always a picture; an AV1 temporal
+    unit is one when it holds a frame or tile group OBU.
+    """
+    if codec.every_frame_is_a_keyframe or codec is VideoCodec.VP9:
+        return True
+    if codec is VideoCodec.H264:
+        return any(1 <= (first & 0x1F) <= 5 for first, _ in _nal_headers(payload))
+    if codec is VideoCodec.H265:
+        return any(((first >> 1) & 0x3F) <= 31 for first, _ in _nal_headers(payload))
+    for frame in _embedded_frames(payload):
+        types = _av1_obu_types(frame)
+        if types is not None:
+            return bool({3, 4, 6} & set(types))
+    return True
+
+
 def is_keyframe(payload: bytes, codec: VideoCodec) -> bool:
     """Whether a decoder can start on this payload."""
     if codec.every_frame_is_a_keyframe:

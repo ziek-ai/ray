@@ -161,6 +161,58 @@ class WindowSpec:
         )
 
 
+@PublicAPI(stability="alpha")
+@dataclass(frozen=True)
+class VideoOptions:
+    """Decode the video topics of a ``read_mcap`` inside the read task.
+
+    Given to ``read_mcap(video=...)`` at ``message`` granularity, every row is
+    one decoded RGB frame in a ``frame`` column, ``uint8`` of shape
+    ``(height, width, 3)``, in place of the encoded ``data``, and every
+    selected topic must be video. At ``window`` granularity each window row
+    carries, per video topic, a ``frames:<topic>`` tensor of shape
+    ``(n, height, width, 3)`` and the matching ``frame_times:<topic>`` log
+    times, while the other topics stay in the message lists; a window's
+    decoded frames are bounded by ``RAY_DATA_MCAP_MAX_ROW_BYTES``, so ``fps``
+    and ``resize`` are what keep a clip small. Video topics are recognised
+    from their schema name or their bytes (JPEG, PNG, H.264, H.265, VP9,
+    AV1). A task that starts mid-stream first decodes the frames back to the
+    previous keyframe, so the frames it emits are complete. Requires ``av``
+    for H.264, H.265, VP9 and AV1 and ``Pillow`` for JPEG and PNG.
+
+    Attributes:
+        fps: Keep at most one frame per ``1/fps`` seconds of log time per
+            topic. The intervals are aligned to the epoch, not to where a read
+            task starts, so the surviving frames do not depend on how the read
+            is split. Measured against ``log_time`` since a topic has no fixed
+            frame rate. ``None`` keeps every frame.
+        resize: Scale frames to this ``(height, width)``; ``None`` keeps the
+            coded size.
+    """
+
+    fps: Optional[float] = None
+    resize: Optional[Tuple[int, int]] = None
+
+    def __post_init__(self):
+        if self.fps is not None and (isinstance(self.fps, bool) or self.fps <= 0):
+            raise ValueError(f"fps must be a positive number, got {self.fps!r}")
+        if self.resize is not None:
+            if len(self.resize) != 2 or any(
+                isinstance(v, bool) or not isinstance(v, int) or v <= 0
+                for v in self.resize
+            ):
+                raise ValueError(
+                    "resize must be a (height, width) pair of positive integers, "
+                    f"got {self.resize!r}"
+                )
+            object.__setattr__(self, "resize", tuple(self.resize))
+
+    @property
+    def fps_interval_ns(self) -> Optional[int]:
+        """Minimum log-time distance between two emitted frames of a topic."""
+        return int(round(_NS_PER_S / self.fps)) if self.fps is not None else None
+
+
 @dataclass(frozen=True)
 class MCAPSelection:
     """Which messages a read selects.

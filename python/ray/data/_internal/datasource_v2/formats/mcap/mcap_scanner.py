@@ -13,6 +13,7 @@ from ray.data._internal.datasource_v2.formats.mcap.mcap_options import (
     MESSAGE_GRANULARITY,
     METADATA_GRANULARITY,
     MCAPSelection,
+    VideoOptions,
     WindowSpec,
 )
 from ray.data._internal.datasource_v2.formats.mcap.mcap_pushdown import (
@@ -61,6 +62,7 @@ class MCAPScanner(
     selection: MCAPSelection = MCAPSelection()
     granularity: str = MESSAGE_GRANULARITY
     window: Optional[WindowSpec] = None
+    video: Optional[VideoOptions] = None
     video_topics: Optional[VideoTopics] = None
     include_metadata: bool = True
     include_row_id: bool = False
@@ -107,6 +109,10 @@ class MCAPScanner(
         if self.granularity == METADATA_GRANULARITY:
             return True
         if self.granularity in (MESSAGE_GRANULARITY, ATTACHMENT_GRANULARITY):
+            if self.video is not None:
+                # Rows are decoded frames: ``fps`` thins them and a decoder may
+                # drop what it cannot decode.
+                return False
             return self.selection.time_range is None
         return False
 
@@ -168,6 +174,7 @@ class MCAPScanner(
             selection=self.selection,
             granularity=self.granularity,
             window=self.window,
+            video=self.video,
             video_topics=self.video_topics,
             include_metadata=self.include_metadata,
             include_row_id=self.include_row_id,

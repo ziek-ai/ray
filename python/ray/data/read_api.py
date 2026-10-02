@@ -71,7 +71,10 @@ from ray.data._internal.datasource.torch_datasource import TorchDatasource
 from ray.data._internal.datasource.video_datasource import VideoDatasource
 from ray.data._internal.datasource.webdataset_datasource import WebDatasetDatasource
 from ray.data._internal.datasource.zarrv2_datasource import ZarrV2Datasource
-from ray.data._internal.datasource_v2.formats.mcap.mcap_options import WindowSpec
+from ray.data._internal.datasource_v2.formats.mcap.mcap_options import (
+    VideoOptions,
+    WindowSpec,
+)
 from ray.data._internal.delegating_block_builder import DelegatingBlockBuilder
 from ray.data._internal.logical.interfaces import LogicalPlan
 from ray.data._internal.logical.operators import (
@@ -3238,6 +3241,7 @@ def read_mcap(
         "message", "window", "topic", "file", "attachment", "metadata"
     ] = "message",
     window: Optional[WindowSpec] = None,
+    video: Optional[VideoOptions] = None,
     filesystem: Optional["pyarrow.fs.FileSystem"] = None,
     parallelism: int = -1,
     num_cpus: Optional[float] = None,
@@ -3378,7 +3382,22 @@ def read_mcap(
             topics are recognised from their schema name or their bytes (JPEG,
             PNG, H.264, H.265, VP9, AV1) and the lead-in reaches back to the
             previous keyframe, at most 10 s (``RAY_DATA_MCAP_MAX_LEAD_IN_S``);
-            a topic whose codec is not recognised carries that whole span.
+            a topic whose codec is not recognised carries that whole span. With
+            ``video`` the window's video topics are decoded instead: per topic a
+            ``frames:<topic>`` column (one ``uint8`` tensor of shape
+            ``(n, height, width, 3)`` per row) and ``frame_times:<topic>`` (the
+            frames' log times), the lead-in consumed by the decoder
+            (``num_lead_in`` is 0), and the other topics in the message lists.
+        video: A :class:`~ray.data.datasource.VideoOptions`: decode the video
+            topics inside the read task. With ``read_granularity="message"``
+            every selected topic must be video and each row is one RGB frame in
+            a ``frame`` column, ``uint8`` of shape ``(height, width, 3)``, in
+            place of ``data``; with ``"window"`` each row carries its window's
+            frames per video topic (see ``window``). ``fps`` keeps at most one
+            frame per interval of log time and ``resize`` scales frames to
+            ``(height, width)``; a window's decoded frames are bounded by
+            ``RAY_DATA_MCAP_MAX_ROW_BYTES``. Requires ``av`` (H.264, H.265, VP9,
+            AV1) or ``Pillow`` (JPEG, PNG).
         filesystem: The PyArrow filesystem implementation to read from.
         parallelism: This argument is deprecated. Use ``override_num_blocks`` argument.
         num_cpus: The number of CPUs to reserve for each parallel read worker.
@@ -3462,6 +3481,7 @@ def read_mcap(
             include_paths=include_paths,
             read_granularity=read_granularity,
             window=window,
+            video=video,
             filesystem=filesystem,
             partitioning=partitioning,
             file_extensions=file_extensions,
@@ -3485,9 +3505,9 @@ def read_mcap(
             partition_filter=partition_filter,
         )
 
-    if include_row_id or read_granularity != "message" or window:
+    if include_row_id or read_granularity != "message" or window or video:
         raise NotImplementedError(
-            "`include_row_id`, `read_granularity` and `window` on "
+            "`include_row_id`, `read_granularity`, `window` and `video` on "
             "`read_mcap` require the V2 datasource. Enable it with "
             "`ray.data.DataContext.get_current().use_datasource_v2 = True` "
             "(or set RAY_DATA_USE_DATASOURCE_V2=1)."

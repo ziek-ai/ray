@@ -39,6 +39,7 @@ from typing_extensions import override
 
 from ray._common.utils import env_integer
 from ray.data._internal.datasource_v2.common.synthesized_columns import PathColumn
+from ray.data._internal.datasource_v2.formats.mcap.mcap_decode import decode_one
 from ray.data._internal.datasource_v2.formats.mcap.mcap_file_indexer import (
     MCAPSummaryIndexer,
 )
@@ -52,6 +53,7 @@ from ray.data._internal.datasource_v2.formats.mcap.mcap_options import (
     WINDOW_GRANULARITY,
     MCAPSelection,
     TimeRange,
+    VideoOptions,
     WindowSpec,
     max_lead_in_ns,
 )
@@ -64,8 +66,10 @@ from ray.data._internal.datasource_v2.formats.mcap.mcap_records import record_sc
 from ray.data._internal.datasource_v2.formats.mcap.mcap_scanner import MCAPScanner
 from ray.data._internal.datasource_v2.formats.mcap.mcap_summary import read_summary
 from ray.data._internal.datasource_v2.formats.mcap.mcap_video import (
+    VideoCodec,
     VideoTopics,
     detect_codec,
+    is_keyframe,
     is_video_schema,
 )
 from ray.data._internal.datasource_v2.formats.mcap.mcap_windows import (
@@ -80,7 +84,11 @@ from ray.data._internal.datasource_v2.interfaces.file_manifest import FileManife
 from ray.data._internal.datasource_v2.interfaces.synthesized_columns import (
     SynthesizedColumn,
 )
-from ray.data._internal.tensor_extensions.arrow import convert_to_pyarrow_array
+from ray.data._internal.tensor_extensions.arrow import (
+    ArrowTensorTypeV2,
+    ArrowVariableShapedTensorType,
+    convert_to_pyarrow_array,
+)
 from ray.data._internal.util import MiB, _check_import, _is_local_scheme
 from ray.data.context import DataContext
 from ray.data.datasource.partitioning import (
@@ -128,6 +136,7 @@ class MCAPDatasourceV2(FileDataSourceV2):
         include_paths: bool = False,
         read_granularity: str = MESSAGE_GRANULARITY,
         window: Optional[WindowSpec] = None,
+        video: Optional[VideoOptions] = None,
         filesystem: Optional["FileSystem"] = None,
         partitioning: Optional[Partitioning] = None,
         file_extensions: Optional[Union[List[str], tuple[str, ...]]] = ("mcap",),
@@ -139,6 +148,7 @@ class MCAPDatasourceV2(FileDataSourceV2):
         _validate_granularity(
             read_granularity,
             window,
+            video,
             selects_channels=bool(topics) or bool(message_types),
             has_time_range=time_range is not None,
         )
@@ -157,6 +167,7 @@ class MCAPDatasourceV2(FileDataSourceV2):
         self._include_row_id = include_row_id
         self._granularity = read_granularity
         self._window = window
+        self._video = video
         # Settled by ``infer_schema`` from the sample files; see ``VideoTopics``.
         self._video_topics = VideoTopics()
         self._partitioning = partitioning
@@ -275,22 +286,35 @@ class MCAPDatasourceV2(FileDataSourceV2):
         assert sample is not None, "MCAP always receives a sample"
         sample_paths = sample.paths.tolist()[:_SCHEMA_SAMPLE_FILES]
         if self._granularity == MESSAGE_GRANULARITY:
+            decode = self._video is not None
             schema = message_schema(
                 include_metadata=self._include_metadata,
                 include_row_id=self._include_row_id,
-                data_type=self._infer_data_type(sample_paths) if sample_paths else None,
+                data_type=(
+                    self._infer_data_type(sample_paths)
+                    if sample_paths and not decode
+                    else None
+                ),
+                frame_type=self._infer_frame_type(sample_paths) if decode else None,
             )
         elif self._granularity in RECORD_GRANULARITIES:
             schema = record_schema(
                 self._granularity, include_row_id=self._include_row_id
             )
         else:
+            video_topics: List[str] = []
             if self._granularity in (WINDOW_GRANULARITY, TOPIC_GRANULARITY):
                 self._video_topics = self._probe_video_topics(sample_paths)
+                if self._video is not None:
+                    # Decoded window rows: the topics planning recognised get
+                    # frame columns, fixed here so every task agrees.
+                    self._check_video_decodable(sample_paths)
+                    video_topics = sorted(self._video_topics.video)
             schema = coarse_row_schema(
                 self._granularity,
                 include_metadata=self._include_metadata,
                 include_row_id=self._include_row_id,
+                video_topics=video_topics,
             )
         partitioning = self.resolve_partitioning(sample)
         if partitioning is not None and len(sample) > 0:
@@ -566,6 +590,164 @@ class MCAPDatasourceV2(FileDataSourceV2):
                         )
         return VideoTopics(video=frozenset(video), probed=frozenset(probed))
 
+    def _check_video_decodable(self, paths: List[str]) -> None:
+        """Fail now if a video topic of the sample cannot be decoded in the task.
+
+        Decoded window rows decode the topics planning recognised as video;
+        the other topics stay in the message lists. Each video topic needs a
+        codec its bytes name (a VP9 or AV1 inter frame does not, so the stream
+        is read on to its first keyframe) and an importable decoder.
+        """
+        assert self._video is not None
+        for path in paths:
+            for channel, schema, message in self._first_messages(path, None):
+                schema_name = schema.name if schema else None
+                if not self._video_topics.recognises(channel.topic, schema_name):
+                    continue
+                codec = detect_codec(message.data) or self._first_codec(
+                    path, channel.id
+                )
+                if codec is None:
+                    raise ValueError(
+                        f"Cannot decode topic {channel.topic!r} in {path!r}: its "
+                        "payloads are not JPEG, PNG, H.264/H.265 Annex-B, VP9 or "
+                        "AV1."
+                    )
+                if codec.every_frame_is_a_keyframe:
+                    _check_import(self, module="PIL", package="Pillow")
+                else:
+                    _check_import(self, module="av", package="av")
+
+    def _infer_frame_type(self, paths: List[str]) -> pa.DataType:
+        """The tensor type of decoded frames, from the sample files.
+
+        Every selected channel of every sample file must be a video topic
+        (by schema name or by its bytes) with a recognisable codec whose
+        decoder is importable, or the read fails here naming the topic; only
+        then is the shape settled. With ``resize``
+        the shape is known; otherwise the first keyframe of the first video
+        channel found is decoded for it. Falls back to a variable-shaped tensor
+        when the sample holds no decodable keyframe.
+        """
+        assert self._video is not None
+        sample: Optional[Tuple[str, int, VideoCodec]] = None
+        recognised: Set[str] = set()
+        for path in paths:
+            for channel, schema, message in self._first_messages(path, None):
+                schema_name = schema.name if schema else None
+                # A VP9 or AV1 inter frame does not name its codec, so a file
+                # that starts mid-GOP is read on to its first keyframe.
+                codec = detect_codec(message.data) or self._first_codec(
+                    path, channel.id
+                )
+                if codec is None:
+                    if self._video_topics.recognises(channel.topic, schema_name):
+                        raise ValueError(
+                            f"Cannot decode topic {channel.topic!r} in {path!r}: its "
+                            "payloads are not JPEG, PNG, H.264/H.265 Annex-B, VP9 or "
+                            "AV1."
+                        )
+                    raise ValueError(
+                        f"Cannot decode topic {channel.topic!r} in {path!r}: it is "
+                        f"not a video topic (schema {schema_name!r}, payload not "
+                        "recognised). Pass topics=[...] to select only the video "
+                        "topics."
+                    )
+                if codec.every_frame_is_a_keyframe:
+                    _check_import(self, module="PIL", package="Pillow")
+                else:
+                    _check_import(self, module="av", package="av")
+                recognised.add(channel.topic)
+                if sample is None:
+                    sample = (path, channel.id, codec)
+        # Every selected topic of the sample is video: carry that to the
+        # readers, so a task whose first payloads do not name the codec waits
+        # for a keyframe instead of failing on a topic planning already vetted.
+        self._video_topics = VideoTopics(
+            video=frozenset(recognised), probed=frozenset(recognised)
+        )
+        if self._video.resize is not None:
+            height, width = self._video.resize
+            return ArrowTensorTypeV2((height, width, 3), pa.uint8())
+        if sample is not None:
+            path, channel_id, codec = sample
+            head = self._stream_head(path, channel_id, codec)
+            frame = decode_one(head, codec, None) if head else None
+            if frame is not None:
+                return ArrowTensorTypeV2(tuple(frame.shape), pa.uint8())
+        return ArrowVariableShapedTensorType(pa.uint8(), 3)
+
+    # How far ``_stream_head`` looks: messages of the channel, and records of
+    # any kind, so a sparse or absent channel in an unindexed file does not turn
+    # planning into a scan of the whole file.
+    _KEYFRAME_SCAN_MESSAGES = 1_000
+    _KEYFRAME_SCAN_RECORDS = 50_000
+
+    def _channel_payloads(self, path: str, channel_id: int) -> Iterable[bytes]:
+        """The channel's payloads in file order, within the scan budget.
+
+        At most ``_KEYFRAME_SCAN_MESSAGES`` of the channel and
+        ``_KEYFRAME_SCAN_RECORDS`` records of any kind are looked at, so a
+        sparse or absent channel in an unindexed file does not turn planning
+        into a scan of the whole file.
+        """
+        from mcap.data_stream import ReadDataStream
+        from mcap.records import Chunk, Message
+        from mcap.stream_reader import StreamReader, breakup_chunk
+
+        summary = read_summary(self._filesystem, path)
+        messages_left = self._KEYFRAME_SCAN_MESSAGES
+        records_left = self._KEYFRAME_SCAN_RECORDS
+        with self._filesystem.open_input_file(path) as f:
+            if summary is None or not summary.chunk_indexes:
+                f.seek(0)
+                records: Any = StreamReader(f).records
+                for record in records:
+                    records_left -= 1
+                    if isinstance(record, Message) and record.channel_id == channel_id:
+                        yield record.data
+                        messages_left -= 1
+                    if messages_left <= 0 or records_left <= 0:
+                        return
+                return
+            for chunk_index in summary.chunk_indexes:
+                if chunk_index.message_index_offsets and channel_id not in (
+                    chunk_index.message_index_offsets
+                ):
+                    continue
+                f.seek(chunk_index.chunk_start_offset + 1 + 8)
+                for record in breakup_chunk(Chunk.read(ReadDataStream(f))):
+                    records_left -= 1
+                    if isinstance(record, Message) and record.channel_id == channel_id:
+                        yield record.data
+                        messages_left -= 1
+                    if messages_left <= 0 or records_left <= 0:
+                        return
+
+    def _first_codec(self, path: str, channel_id: int) -> Optional[VideoCodec]:
+        """The first codec any payload of the channel names, within the scan budget."""
+        for payload in self._channel_payloads(path, channel_id):
+            codec = detect_codec(payload)
+            if codec is not None:
+                return codec
+        return None
+
+    def _stream_head(
+        self, path: str, channel_id: int, codec: VideoCodec
+    ) -> List[bytes]:
+        """The channel's payloads from its first message through its first keyframe.
+
+        Empty when no keyframe is found within the scan budget. The messages
+        before the keyframe matter: a recorder may write the parameter sets in
+        a message of their own.
+        """
+        head: List[bytes] = []
+        for payload in self._channel_payloads(path, channel_id):
+            head.append(payload)
+            if is_keyframe(payload, codec):
+                return head
+        return []
+
     def create_scanner(
         self,
         schema: pa.Schema,
@@ -577,6 +759,7 @@ class MCAPDatasourceV2(FileDataSourceV2):
             selection=self._selection,
             granularity=self._granularity,
             window=self._window,
+            video=self._video,
             video_topics=self._video_topics,
             include_metadata=self._include_metadata,
             include_row_id=self._include_row_id,
@@ -596,6 +779,7 @@ class MCAPDatasourceV2(FileDataSourceV2):
 def _validate_granularity(
     granularity: str,
     window: Optional[WindowSpec],
+    video: Optional[VideoOptions],
     *,
     selects_channels: bool = False,
     has_time_range: bool = False,
@@ -624,4 +808,15 @@ def _validate_granularity(
     if granularity != WINDOW_GRANULARITY and window is not None:
         raise ValueError(
             f"window applies to read_granularity='window', not {granularity!r}"
+        )
+    if video is not None and granularity not in (
+        MESSAGE_GRANULARITY,
+        WINDOW_GRANULARITY,
+    ):
+        raise ValueError(
+            "video decodes the video topics into frames and applies to "
+            "read_granularity='message' (one frame per row) and 'window' (a "
+            f"window's frames per topic), not {granularity!r}: a decoded "
+            f"{granularity} row would hold minutes to hours of frames in one "
+            "value that cannot be cut into blocks"
         )
