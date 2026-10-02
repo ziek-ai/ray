@@ -3234,7 +3234,9 @@ def read_mcap(
     include_metadata: bool = True,
     log_time_order: bool = True,
     include_row_id: bool = False,
-    read_granularity: Literal["message", "window", "topic", "file"] = "message",
+    read_granularity: Literal[
+        "message", "window", "topic", "file", "attachment", "metadata"
+    ] = "message",
     window: Optional[WindowSpec] = None,
     filesystem: Optional["pyarrow.fs.FileSystem"] = None,
     parallelism: int = -1,
@@ -3361,7 +3363,12 @@ def read_mcap(
             ``time_range`` cuts the stream mid-GOP, the frames from the keyframe
             before the range are prepended and counted by ``num_lead_in``.
             A topic or file row over 1 GiB of payload fails the read
-            (``RAY_DATA_MCAP_MAX_ROW_BYTES``). Requires the V2 datasource.
+            (``RAY_DATA_MCAP_MAX_ROW_BYTES``). ``"attachment"`` and ``"metadata"``
+            return the files' Attachment records (``name``, ``media_type``,
+            ``log_time``, ``create_time``, ``data``) and Metadata records (``name``,
+            ``metadata`` as a ``map<string, string>``), one per row, instead of
+            messages; ``topics`` and ``message_types`` do not apply to them, and
+            ``time_range`` only to attachments. Requires the V2 datasource.
         window: Required with ``read_granularity="window"``: a
             :class:`~ray.data.datasource.WindowSpec` giving the window length,
             stride and anchor. Window rows also carry ``window_start``,

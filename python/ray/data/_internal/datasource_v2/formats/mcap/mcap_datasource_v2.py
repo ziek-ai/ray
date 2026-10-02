@@ -46,6 +46,8 @@ from ray.data._internal.datasource_v2.formats.mcap.mcap_options import (
     FILE_GRANULARITY,
     GRANULARITIES,
     MESSAGE_GRANULARITY,
+    METADATA_GRANULARITY,
+    RECORD_GRANULARITIES,
     TOPIC_GRANULARITY,
     WINDOW_GRANULARITY,
     MCAPSelection,
@@ -58,6 +60,7 @@ from ray.data._internal.datasource_v2.formats.mcap.mcap_reader import (
     decode_payload,
     message_schema,
 )
+from ray.data._internal.datasource_v2.formats.mcap.mcap_records import record_schema
 from ray.data._internal.datasource_v2.formats.mcap.mcap_scanner import MCAPScanner
 from ray.data._internal.datasource_v2.formats.mcap.mcap_summary import read_summary
 from ray.data._internal.datasource_v2.formats.mcap.mcap_video import (
@@ -91,8 +94,8 @@ from ray.util.debug import log_once
 
 if TYPE_CHECKING:
     from mcap.records import Channel, Message, Schema
-    from pyarrow.fs import FileSystem
     from mcap.summary import Summary
+    from pyarrow.fs import FileSystem
 
     from ray.data.datasource.file_based_datasource import FileShuffleConfig
 
@@ -133,7 +136,12 @@ class MCAPDatasourceV2(FileDataSourceV2):
     ):
         super().__init__(name="MCAP", category=DatasourceCategory.FILE_BASED)
         _check_import(self, module="mcap", package="mcap")
-        _validate_granularity(read_granularity, window)
+        _validate_granularity(
+            read_granularity,
+            window,
+            selects_channels=bool(topics) or bool(message_types),
+            has_time_range=time_range is not None,
+        )
 
         # Captured against the original paths: resolution below strips the
         # ``local://`` scheme (see ``ParquetDatasourceV2``).
@@ -271,6 +279,10 @@ class MCAPDatasourceV2(FileDataSourceV2):
                 include_metadata=self._include_metadata,
                 include_row_id=self._include_row_id,
                 data_type=self._infer_data_type(sample_paths) if sample_paths else None,
+            )
+        elif self._granularity in RECORD_GRANULARITIES:
+            schema = record_schema(
+                self._granularity, include_row_id=self._include_row_id
             )
         else:
             if self._granularity in (WINDOW_GRANULARITY, TOPIC_GRANULARITY):
@@ -581,12 +593,28 @@ class MCAPDatasourceV2(FileDataSourceV2):
         )
 
 
-def _validate_granularity(granularity: str, window: Optional[WindowSpec]) -> None:
+def _validate_granularity(
+    granularity: str,
+    window: Optional[WindowSpec],
+    *,
+    selects_channels: bool = False,
+    has_time_range: bool = False,
+) -> None:
     """Reject option combinations that cannot mean anything."""
     if granularity not in GRANULARITIES:
         raise ValueError(
             f"read_granularity must be one of {list(GRANULARITIES)}, got "
             f"{granularity!r}"
+        )
+    if granularity in RECORD_GRANULARITIES and selects_channels:
+        raise ValueError(
+            "topics and message_types select messages; they do not apply to "
+            f"read_granularity={granularity!r}"
+        )
+    if granularity == METADATA_GRANULARITY and has_time_range:
+        raise ValueError(
+            "Metadata records carry no timestamp; time_range does not apply to "
+            "read_granularity='metadata'"
         )
     if granularity == WINDOW_GRANULARITY and window is None:
         raise ValueError(
