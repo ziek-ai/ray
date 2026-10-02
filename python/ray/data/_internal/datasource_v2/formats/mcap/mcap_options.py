@@ -1,7 +1,7 @@
-"""Filter options shared by the MCAP datasources.
+"""Options shared by the MCAP datasources.
 
-``TimeRange`` is the public filter type ``read_mcap`` accepts; it is re-exported
-from ``ray.data.datasource`` and from the legacy ``MCAPDatasource`` module.
+``TimeRange`` and ``WindowSpec`` are the public option types ``read_mcap``
+accepts; they are re-exported from ``ray.data.datasource``.
 
 ``MCAPSelection`` bundles the three message filters of ``read_mcap`` (``topics``,
 ``message_types``, ``time_range``) and answers, from summary records alone,
@@ -10,17 +10,69 @@ reader both ask it, so a chunk the indexer keeps is one the reader scans and a
 chunk it drops is one no task ever opens.
 
 Nothing from the ``mcap`` package is imported at module level: ``read_api``
-imports ``TimeRange`` whether or not ``mcap`` is installed.
+imports these types whether or not ``mcap`` is installed.
 """
 
+import hashlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, FrozenSet, Iterable, Mapping, Optional, Set
+from typing import (
+    TYPE_CHECKING,
+    FrozenSet,
+    Iterable,
+    Literal,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
+
+from ray._common.utils import env_float
+from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
     from mcap.records import Channel, ChunkIndex, Schema, Statistics
 
 # Name of the deterministic per-row id column (see ``MCAPReader``).
 ROW_ID_COLUMN = "row_id"
+
+# What one output row is. ``message`` is today's row; the other three pack the
+# messages of a time window, a topic or a whole file into one row of lists.
+RowType = Literal["message", "window", "topic", "file"]
+MESSAGE_GRANULARITY = "message"
+WINDOW_GRANULARITY = "window"
+TOPIC_GRANULARITY = "topic"
+FILE_GRANULARITY = "file"
+GRANULARITIES: Tuple[str, ...] = (
+    MESSAGE_GRANULARITY,
+    WINDOW_GRANULARITY,
+    TOPIC_GRANULARITY,
+    FILE_GRANULARITY,
+)
+
+_NS_PER_S = 1_000_000_000
+
+
+def _seconds_to_ns(seconds: float) -> int:
+    return int(round(seconds * _NS_PER_S))
+
+
+# How far back a window looks for a keyframe on a video topic, in seconds. It
+# bounds what a read task reads before a window, and a video topic whose
+# keyframes cannot be told from the bytes gets this whole span as its lead-in.
+# Not part of the API: ``RAY_DATA_MCAP_MAX_LEAD_IN_S`` overrides the default.
+DEFAULT_MAX_LEAD_IN_S = 10.0
+DEFAULT_MAX_LEAD_IN_NS = _seconds_to_ns(DEFAULT_MAX_LEAD_IN_S)
+
+
+def max_lead_in_ns() -> int:
+    """The look-back cap in nanoseconds, honouring ``RAY_DATA_MCAP_MAX_LEAD_IN_S``."""
+    seconds = env_float("RAY_DATA_MCAP_MAX_LEAD_IN_S", DEFAULT_MAX_LEAD_IN_S)
+    if seconds < 0:
+        raise ValueError(
+            f"RAY_DATA_MCAP_MAX_LEAD_IN_S must be non-negative, got {seconds}"
+        )
+    return _seconds_to_ns(seconds)
 
 
 @dataclass
@@ -47,6 +99,59 @@ class TimeRange:
                 f"time values must be non-negative, got start_time={self.start_time}, "
                 f"end_time={self.end_time}"
             )
+
+
+@PublicAPI(stability="alpha")
+@dataclass(frozen=True)
+class WindowSpec:
+    """How ``read_mcap(read_granularity="window")`` cuts a recording into rows.
+
+    Every row is one half-open window ``[start, start + length_s)`` of log time
+    within one file, holding every selected message logged inside it. Windows
+    with no messages are not emitted.
+
+    Attributes:
+        length_s: Window length in seconds.
+        stride_s: Distance between the starts of consecutive windows, in
+            seconds. Defaults to ``length_s`` (back-to-back windows). Smaller
+            gives overlapping windows, which duplicate messages on purpose.
+        anchor: Where window 0 starts. ``"file_start"`` puts it at the file's
+            first message; ``"epoch"`` aligns window starts to multiples of
+            ``stride_s`` since the Unix epoch, so windows line up across files;
+            an ``int`` is an absolute nanosecond timestamp that windows are
+            aligned to, before and after it.
+        drop_partial: Drop a window that runs past the file's last message
+            instead of emitting it short.
+    """
+
+    length_s: float
+    stride_s: Optional[float] = None
+    anchor: Union[Literal["file_start", "epoch"], int] = "file_start"
+    drop_partial: bool = False
+
+    def __post_init__(self):
+        if self.length_s <= 0:
+            raise ValueError(f"length_s must be positive, got {self.length_s}")
+        if self.stride_s is not None and self.stride_s <= 0:
+            raise ValueError(f"stride_s must be positive, got {self.stride_s}")
+        if isinstance(self.anchor, bool) or not (
+            self.anchor in ("file_start", "epoch")
+            or (isinstance(self.anchor, int) and self.anchor >= 0)
+        ):
+            raise ValueError(
+                "anchor must be 'file_start', 'epoch' or a non-negative "
+                f"nanosecond timestamp, got {self.anchor!r}"
+            )
+
+    @property
+    def length_ns(self) -> int:
+        return _seconds_to_ns(self.length_s)
+
+    @property
+    def stride_ns(self) -> int:
+        return _seconds_to_ns(
+            self.stride_s if self.stride_s is not None else self.length_s
+        )
 
 
 @dataclass(frozen=True)
@@ -97,6 +202,26 @@ class MCAPSelection:
     @property
     def end_time(self) -> Optional[int]:
         return self.time_range.end_time if self.time_range is not None else None
+
+    def digest(self) -> str:
+        """Short, stable hash of the selection, part of every coarse row's id.
+
+        A window, topic or file row's content depends on which messages were
+        selected, so its id must change when the selection does; otherwise a
+        checkpoint written under one selection would skip rows of another.
+        Message rows do not need it: one message's content does not depend
+        on what else was selected.
+        """
+        parts = [
+            ",".join(sorted(self.topics)) if self.topics is not None else "*",
+            ",".join(sorted(self.message_types))
+            if self.message_types is not None
+            else "*",
+            f"{self.start_time}-{self.end_time}"
+            if self.time_range is not None
+            else "*",
+        ]
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:8]
 
     def accepts_channel(self, channel: "Channel", schema: Optional["Schema"]) -> bool:
         """Whether messages on ``channel`` pass the topic and schema filters."""
