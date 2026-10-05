@@ -4,7 +4,6 @@ import pytest
 
 from ray.train.health import (
     ControllerProbe,
-    ControllerProbeContext,
     Diagnose,
     Evaluator,
     Evict,
@@ -41,9 +40,9 @@ class CommProgress(ControllerProbe):
     def __init__(self):
         self.polls = 0
 
-    def poll(self, ctx):
+    def poll(self):
         self.polls += 1
-        return {"comm0": ProbeResult(metrics={"ranks": float(len(ctx.rank_to_node))})}
+        return {"comm0": ProbeResult(metrics={"polls": float(self.polls)})}
 
 
 class Healthy(Evaluator):
@@ -89,11 +88,8 @@ def test_results_are_read_by_probe_class():
 
 def test_a_controller_probe_reports_its_own_keys_and_keeps_state():
     probe = CommProgress()
-    ctx = ControllerProbeContext(rank_to_node={0: "nA", 1: "nB"})
-    assert probe.poll(ctx) == {"comm0": ProbeResult(metrics={"ranks": 2.0})}
-    probe.poll(ctx)
-    assert probe.polls == 2
-    assert ControllerProbeContext().rank_to_node == {}
+    assert probe.poll() == {"comm0": ProbeResult(metrics={"polls": 1.0})}
+    assert probe.poll() == {"comm0": ProbeResult(metrics={"polls": 2.0})}
 
 
 def test_results_of_a_controller_probe_are_keyed_by_its_keys():

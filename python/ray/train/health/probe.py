@@ -82,18 +82,6 @@ class NodeProbe(Probe):
 
 
 @PublicAPI(stability="alpha")
-@dataclass(frozen=True)
-class ControllerProbeContext:
-    """What a ``ControllerProbe`` is told about the current workers.
-
-    Attributes:
-        rank_to_node: ``{world rank: node ID}`` for every worker.
-    """
-
-    rank_to_node: Dict[int, NodeIdStr] = field(default_factory=dict)
-
-
-@PublicAPI(stability="alpha")
 class ControllerProbe(Probe):
     """A probe that runs in the Ray Train controller process.
 
@@ -103,11 +91,8 @@ class ControllerProbe(Probe):
     """
 
     @abc.abstractmethod
-    def poll(self, ctx: ControllerProbeContext) -> Dict[str, ProbeResult]:
+    def poll(self) -> Dict[str, ProbeResult]:
         """Poll once.
-
-        Args:
-            ctx: The current workers.
 
         Returns:
             ``{key: ProbeResult}``.
